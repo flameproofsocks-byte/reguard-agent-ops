@@ -1,0 +1,30 @@
+# Environment & secrets
+.env
+*.env
+
+# Virtual environment
+.venv/
+
+# Live data (not tracked)
+projects/
+routines/
+
+# Claude Code workspace
+.claude/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Logs & pids
+*.log
+*.pid
+/tmp/
+
+# OS
+.DS_Store
