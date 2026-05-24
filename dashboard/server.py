@@ -1115,6 +1115,31 @@ async def run_agent_chat_full(a: dict, project: dict, content: str) -> dict:
 
 # ── Telegram bot ──
 
+def _list_installed_skills() -> list[dict]:
+    skills_dir = Path.home() / ".claude" / "skills"
+    skills = []
+    if not skills_dir.exists():
+        return skills
+    for skill_dir in sorted(skills_dir.iterdir()):
+        if not skill_dir.is_dir():
+            continue
+        skill_md = skill_dir / "SKILL.md"
+        if not skill_md.exists():
+            continue
+        name = skill_dir.name
+        description = ""
+        try:
+            for line in skill_md.read_text().splitlines():
+                line = line.strip()
+                if line.startswith("description:"):
+                    description = line[len("description:"):].strip().strip('"')
+                    break
+        except Exception:
+            pass
+        skills.append({"name": name, "description": description})
+    return skills
+
+
 def _tg_get_target_agent(chat_id: int) -> Optional[dict]:
     agent_id = telegram_chat_agents.get(chat_id)
     if agent_id and agent_id in agents_store:
@@ -1392,6 +1417,86 @@ def build_telegram_app(token: str):
             reply += f"\nLinked to project: {project['name']}"
         await update.message.reply_text(reply)
 
+    async def cmd_skills(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        skills = _list_installed_skills()
+        if not skills:
+            await update.message.reply_text("No skills found in ~/.claude/skills/")
+            return
+        lines = [f"Installed skills ({len(skills)}):"]
+        for s in skills:
+            desc = s["description"]
+            if len(desc) > 90:
+                desc = desc[:90] + "…"
+            lines.append(f"\n/{s['name']}")
+            if desc:
+                lines.append(f"  {desc}")
+        lines.append("\nUse /skill <name> [message] to invoke on the active agent.")
+        await update.message.reply_text("\n".join(lines))
+
+    async def cmd_skill(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        if not ctx.args:
+            await update.message.reply_text("Usage: /skill <name> [message]\nUse /skills to list available skills.")
+            return
+        skill_name = ctx.args[0].lstrip("/")
+        extra = " ".join(ctx.args[1:]) if len(ctx.args) > 1 else ""
+        agent = _tg_get_target_agent(chat_id)
+        if not agent:
+            await update.message.reply_text("No active agent. Create one first.")
+            return
+        invoke_msg = f"/{skill_name}" + (f" {extra}" if extra else "")
+        thinking_msg = await update.message.reply_text(f"⏳ Running /{skill_name}...")
+        user_msg = {"id": str(uuid.uuid4())[:8], "role": "user", "content": invoke_msg, "ts": _ts()}
+        agent["chat_messages"].append(user_msg)
+        if _main_loop:
+            asyncio.run_coroutine_threadsafe(broadcast({"type": "agent_updated", "agent": agent}), _main_loop)
+        project = projects_store.get(agent.get("project_id") or "", {})
+        try:
+            asst_msg = await run_agent_chat_full(agent, project, invoke_msg)
+        except Exception as e:
+            await thinking_msg.edit_text(f"Error: {e}")
+            return
+        agent["chat_messages"].append(asst_msg)
+        agent["action_log"].append({"ts": _ts(), "text": f"[SKILL] /{skill_name}"})
+        agent["action_log"] = agent["action_log"][-100:]
+        save_agent(agent)
+        if _main_loop:
+            asyncio.run_coroutine_threadsafe(broadcast({"type": "agent_updated", "agent": agent}), _main_loop)
+        response = asst_msg["content"] or "(no response)"
+        if len(response) <= 4096:
+            await thinking_msg.edit_text(response)
+        else:
+            await thinking_msg.edit_text(response[:4096])
+            for i in range(4096, len(response), 4096):
+                await update.message.reply_text(response[i:i + 4096])
+
+    async def cmd_claudehelp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text(
+            "Claude Code slash commands:\n\n"
+            "/init — generate a CLAUDE.md for a project\n"
+            "/review — review code changes on current branch\n"
+            "/security-review — security audit of pending changes\n"
+            "/code-review — review a pull request\n"
+            "/run — start and test the project app\n"
+            "/verify — verify a recent change works end-to-end\n"
+            "/compact — compact the agent's context window\n"
+            "/schedule — create a scheduled remote agent\n"
+            "/loop — run a command on a recurring interval\n"
+            "/find-skills — discover and install new skills\n\n"
+            "Use /skills to list installed skills.\n"
+            "Use /skill <name> [message] to invoke a skill on the active agent."
+        )
+
+    async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("Restarting dashboard... back in ~10 seconds.")
+        script = str(Path(__file__).parent.parent / "restart-dashboard.sh")
+        subprocess.Popen(
+            ["bash", "-c", f"sleep 2 && bash {script}"],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
     async def cmd_chatid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         await update.message.reply_text(
@@ -1491,7 +1596,12 @@ def build_telegram_app(token: str):
             "/routines run <name> — run a routine immediately\n"
             "/routines stop <name> — stop a running routine\n"
             "/routines enable/disable <name> — toggle a routine\n"
-            "/chatid — get this chat's ID for alert configuration\n\n"
+            "/chatid — get this chat's ID for alert configuration\n"
+            "/restart — restart the dashboard\n\n"
+            "Claude Code:\n"
+            "/claudehelp — list Claude Code slash commands\n"
+            "/skills — list installed skills\n"
+            "/skill <name> [message] — invoke a skill on the active agent\n\n"
             "Send any other message to chat with the active agent."
         )
 
@@ -1521,6 +1631,10 @@ def build_telegram_app(token: str):
     bot_app.add_handler(CommandHandler("newagent", cmd_newagent))
     bot_app.add_handler(CommandHandler("routines", cmd_routines))
     bot_app.add_handler(CommandHandler("chatid", cmd_chatid))
+    bot_app.add_handler(CommandHandler("skills", cmd_skills))
+    bot_app.add_handler(CommandHandler("skill", cmd_skill))
+    bot_app.add_handler(CommandHandler("claudehelp", cmd_claudehelp))
+    bot_app.add_handler(CommandHandler("restart", cmd_restart))
     bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     return bot_app
 
