@@ -1505,6 +1505,48 @@ def build_telegram_app(token: str):
             f"TELEGRAM_ALERT_CHAT_ID={chat_id}"
         )
 
+    async def cmd_screenshot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        import io as _io
+        import struct as _struct
+
+        display = os.environ.get("DISPLAY", ":1")
+        try:
+            from PIL import Image as _Image
+            proc = await asyncio.create_subprocess_exec(
+                "xwd", "-root", "-silent",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "DISPLAY": display},
+            )
+            xwd_data, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+        except asyncio.TimeoutError:
+            await update.message.reply_text("Screenshot timed out.")
+            return
+        except FileNotFoundError:
+            await update.message.reply_text("xwd not found. Install x11-apps on the server.")
+            return
+
+        if proc.returncode != 0 or len(xwd_data) < 100:
+            err = stderr.decode().strip() or f"xwd exited {proc.returncode}"
+            await update.message.reply_text(f"Screenshot failed: {err}")
+            return
+
+        try:
+            header_size = _struct.unpack(">I", xwd_data[:4])[0]
+            ncolors     = _struct.unpack(">I", xwd_data[76:80])[0]
+            width       = _struct.unpack(">I", xwd_data[16:20])[0]
+            height      = _struct.unpack(">I", xwd_data[20:24])[0]
+            bpl         = _struct.unpack(">I", xwd_data[48:52])[0]
+            pixel_offset = header_size + ncolors * 12
+            raw = xwd_data[pixel_offset:]
+            img = _Image.frombuffer("RGB", (width, height), raw, "raw", "BGR", bpl, 1)
+            buf = _io.BytesIO()
+            img.save(buf, format="PNG")
+            buf.seek(0)
+            await update.message.reply_photo(buf, caption="Screenshot")
+        except Exception as e:
+            await update.message.reply_text(f"Failed to encode screenshot: {e}")
+
     async def cmd_routines(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         args = ctx.args or []
         subcommand = args[0].lower() if args else None
@@ -1597,6 +1639,7 @@ def build_telegram_app(token: str):
             "/routines stop <name> — stop a running routine\n"
             "/routines enable/disable <name> — toggle a routine\n"
             "/chatid — get this chat's ID for alert configuration\n"
+            "/screenshot — send a screenshot of the current screen\n"
             "/restart — restart the dashboard\n\n"
             "Claude Code:\n"
             "/claudehelp — list Claude Code slash commands\n"
@@ -1631,6 +1674,7 @@ def build_telegram_app(token: str):
     bot_app.add_handler(CommandHandler("newagent", cmd_newagent))
     bot_app.add_handler(CommandHandler("routines", cmd_routines))
     bot_app.add_handler(CommandHandler("chatid", cmd_chatid))
+    bot_app.add_handler(CommandHandler("screenshot", cmd_screenshot))
     bot_app.add_handler(CommandHandler("skills", cmd_skills))
     bot_app.add_handler(CommandHandler("skill", cmd_skill))
     bot_app.add_handler(CommandHandler("claudehelp", cmd_claudehelp))
