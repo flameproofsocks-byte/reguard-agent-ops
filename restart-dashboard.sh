@@ -5,4 +5,4 @@ DIR="$(cd "$(dirname "$0")" && pwd)"
 
 "$DIR/stop-dashboard.sh"
 sleep 3
-"$DIR/start-dashboard.sh"
+"$DIR/start-dashboard.sh" "$@"

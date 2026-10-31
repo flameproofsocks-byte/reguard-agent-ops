@@ -475,6 +475,10 @@ async def broadcast(message: dict):
     connections.difference_update(dead)
 
 
+# Model aliases accepted by the `claude` CLI's --model flag
+AVAILABLE_MODELS = ["sonnet", "opus", "haiku", "fable"]
+DEFAULT_MODEL = "sonnet"
+
 # ── Pydantic models ──
 
 class CreateAgent(BaseModel):
@@ -484,12 +488,14 @@ class CreateAgent(BaseModel):
     animal: int = 0
     project_id: Optional[str] = None
     is_main: bool = False
+    model: str = DEFAULT_MODEL
 
 class UpdateAgent(BaseModel):
     status: Optional[str] = None
     progress: Optional[str] = None
     agenda: Optional[str] = None
     token_count: Optional[int] = None
+    model: Optional[str] = None
 
 class AddPermission(BaseModel):
     tool: str
@@ -685,6 +691,8 @@ async def list_agents():
 
 @app.post("/api/agents")
 async def create_agent(req: CreateAgent):
+    if req.model not in AVAILABLE_MODELS:
+        raise HTTPException(400, f"Unknown model '{req.model}'. Choose from: {', '.join(AVAILABLE_MODELS)}")
     agent = {
         "id": str(uuid.uuid4())[:8],
         "name": req.name,
@@ -693,6 +701,7 @@ async def create_agent(req: CreateAgent):
         "animal": req.animal,
         "project_id": req.project_id,
         "is_main": req.is_main,
+        "model": req.model or DEFAULT_MODEL,
         "status": "idle",
         "progress": "Waiting to start...",
         "permissions": [],
@@ -739,6 +748,10 @@ async def update_agent(agent_id: str, req: UpdateAgent):
         a["agenda"] = req.agenda
     if req.token_count is not None:
         a["token_count"] = req.token_count
+    if req.model is not None:
+        if req.model not in AVAILABLE_MODELS:
+            raise HTTPException(400, f"Unknown model '{req.model}'. Choose from: {', '.join(AVAILABLE_MODELS)}")
+        a["model"] = req.model
     save_agent(a)
     await broadcast({"type": "agent_updated", "agent": a})
     return a
@@ -790,102 +803,112 @@ async def chat(agent_id: str, req: ChatMsg):
         write_claude_md(agent_dir, a, project)
         session_id = get_session_id(agent_dir)
 
-        cmd = [
-            "claude", "-p", req.content,
-            "--output-format", "stream-json",
-            "--verbose",
-            "--dangerously-skip-permissions",
-        ]
-        if session_id:
-            cmd += ["--resume", session_id]
+        for attempt in range(2):
+            cmd = [
+                "claude", "-p", req.content,
+                "--output-format", "stream-json",
+                "--verbose",
+                "--dangerously-skip-permissions",
+                "--model", a.get("model") or DEFAULT_MODEL,
+            ]
+            if session_id:
+                cmd += ["--resume", session_id]
 
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(agent_dir),
-            )
-        except FileNotFoundError:
-            yield f"data: {json.dumps({'type': 'error', 'error': 'claude CLI not found — install Claude Code first.'})}\n\n"
-            return
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=str(agent_dir),
+                    limit=10 * 1024 * 1024,  # 10 MB — prevents "chunk is longer than limit" on long JSON lines
+                )
+            except FileNotFoundError:
+                yield f"data: {json.dumps({'type': 'error', 'error': 'claude CLI not found — install Claude Code first.'})}\n\n"
+                return
 
-        thinking_buf = []
-        text_buf = []
+            thinking_buf = []
+            text_buf = []
 
-        try:
-            while True:
-                raw = await proc.stdout.readline()
-                if not raw:
-                    break
-                line = raw.decode().strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except Exception:
-                    continue
+            try:
+                while True:
+                    raw = await proc.stdout.readline()
+                    if not raw:
+                        break
+                    line = raw.decode().strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except Exception:
+                        continue
 
-                etype = event.get("type")
+                    etype = event.get("type")
 
-                if etype == "system" and event.get("subtype") == "init":
-                    sid = event.get("session_id")
-                    if sid:
-                        save_session_id(agent_dir, sid)
+                    if etype == "system" and event.get("subtype") == "init":
+                        sid = event.get("session_id")
+                        if sid:
+                            save_session_id(agent_dir, sid)
 
-                elif etype == "assistant":
-                    content = event.get("message", {}).get("content", [])
-                    if isinstance(content, str):
-                        text_buf.append(content)
-                        yield f"data: {json.dumps({'type': 'text_start'})}\n\n"
-                        yield f"data: {json.dumps({'type': 'text', 'text': content})}\n\n"
-                    else:
-                        for block in content:
-                            btype = block.get("type")
-                            if btype == "thinking":
-                                chunk = block.get("thinking", "")
-                                thinking_buf.append(chunk)
-                                yield f"data: {json.dumps({'type': 'thinking_start'})}\n\n"
-                                yield f"data: {json.dumps({'type': 'thinking', 'text': chunk})}\n\n"
-                            elif btype == "text":
-                                chunk = block.get("text", "")
-                                text_buf.append(chunk)
-                                yield f"data: {json.dumps({'type': 'text_start'})}\n\n"
-                                yield f"data: {json.dumps({'type': 'text', 'text': chunk})}\n\n"
+                    elif etype == "assistant":
+                        content = event.get("message", {}).get("content", [])
+                        if isinstance(content, str):
+                            text_buf.append(content)
+                            yield f"data: {json.dumps({'type': 'text_start'})}\n\n"
+                            yield f"data: {json.dumps({'type': 'text', 'text': content})}\n\n"
+                        else:
+                            for block in content:
+                                btype = block.get("type")
+                                if btype == "thinking":
+                                    chunk = block.get("thinking", "")
+                                    thinking_buf.append(chunk)
+                                    yield f"data: {json.dumps({'type': 'thinking_start'})}\n\n"
+                                    yield f"data: {json.dumps({'type': 'thinking', 'text': chunk})}\n\n"
+                                elif btype == "text":
+                                    chunk = block.get("text", "")
+                                    text_buf.append(chunk)
+                                    yield f"data: {json.dumps({'type': 'text_start'})}\n\n"
+                                    yield f"data: {json.dumps({'type': 'text', 'text': chunk})}\n\n"
 
-                elif etype == "result":
-                    usage = event.get("usage") or {}
-                    tokens = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-                    if tokens:
-                        a["token_count"] = tokens
+                    elif etype == "result":
+                        usage = event.get("usage") or {}
+                        tokens = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+                        if tokens:
+                            a["token_count"] = tokens
 
-        except Exception as e:
-            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
-            proc.kill()
+            except Exception as e:
+                yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+                proc.kill()
+                await proc.wait()
+                return
+
             await proc.wait()
+
+            if proc.returncode != 0 and not text_buf:
+                stderr_data = await proc.stderr.read()
+                err = stderr_data.decode().strip() or f"claude exited with code {proc.returncode}"
+                if session_id and attempt == 0 and "No conversation found" in err:
+                    # Stale/orphaned session pointer — drop it and retry fresh instead
+                    # of getting permanently stuck resuming a session that no longer exists.
+                    delete_session_id(agent_dir)
+                    session_id = None
+                    continue
+                yield f"data: {json.dumps({'type': 'error', 'error': err})}\n\n"
+                return
+
+            asst_msg = {
+                "id": str(uuid.uuid4())[:8],
+                "role": "assistant",
+                "content": "".join(text_buf),
+                "thinking": "".join(thinking_buf),
+                "ts": _ts(),
+            }
+            a["chat_messages"].append(asst_msg)
+            a["action_log"].append({"ts": _ts(), "text": f"[CHAT] {req.content[:60]}"})
+            a["action_log"] = a["action_log"][-100:]
+            save_agent(a)
+            await broadcast({"type": "agent_updated", "agent": a})
+            yield f"data: {json.dumps({'type': 'done', 'message': asst_msg})}\n\n"
             return
-
-        await proc.wait()
-
-        if proc.returncode != 0 and not text_buf:
-            stderr_data = await proc.stderr.read()
-            err = stderr_data.decode().strip() or f"claude exited with code {proc.returncode}"
-            yield f"data: {json.dumps({'type': 'error', 'error': err})}\n\n"
-            return
-
-        asst_msg = {
-            "id": str(uuid.uuid4())[:8],
-            "role": "assistant",
-            "content": "".join(text_buf),
-            "thinking": "".join(thinking_buf),
-            "ts": _ts(),
-        }
-        a["chat_messages"].append(asst_msg)
-        a["action_log"].append({"ts": _ts(), "text": f"[CHAT] {req.content[:60]}"})
-        a["action_log"] = a["action_log"][-100:]
-        save_agent(a)
-        await broadcast({"type": "agent_updated", "agent": a})
-        yield f"data: {json.dumps({'type': 'done', 'message': asst_msg})}\n\n"
 
     return StreamingResponse(
         generate(),
@@ -1045,72 +1068,81 @@ async def run_agent_chat_full(a: dict, project: dict, content: str) -> dict:
     write_claude_md(agent_dir, a, project)
     session_id = get_session_id(agent_dir)
 
-    cmd = [
-        "claude", "-p", content,
-        "--output-format", "stream-json",
-        "--verbose",
-        "--dangerously-skip-permissions",
-    ]
-    if session_id:
-        cmd += ["--resume", session_id]
+    for attempt in range(2):
+        cmd = [
+            "claude", "-p", content,
+            "--output-format", "stream-json",
+            "--verbose",
+            "--dangerously-skip-permissions",
+            "--model", a.get("model") or DEFAULT_MODEL,
+        ]
+        if session_id:
+            cmd += ["--resume", session_id]
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=str(agent_dir),
-    )
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(agent_dir),
+            limit=10 * 1024 * 1024,  # 10 MB — prevents "chunk is longer than limit" on long JSON lines
+        )
 
-    thinking_buf = []
-    text_buf = []
+        thinking_buf = []
+        text_buf = []
 
-    while True:
-        raw = await proc.stdout.readline()
-        if not raw:
-            break
-        line = raw.decode().strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except Exception:
-            continue
-        etype = event.get("type")
-        if etype == "system" and event.get("subtype") == "init":
-            sid = event.get("session_id")
-            if sid:
-                save_session_id(agent_dir, sid)
-        elif etype == "assistant":
-            blocks = event.get("message", {}).get("content", [])
-            if isinstance(blocks, str):
-                text_buf.append(blocks)
-            else:
-                for block in blocks:
-                    btype = block.get("type")
-                    if btype == "thinking":
-                        thinking_buf.append(block.get("thinking", ""))
-                    elif btype == "text":
-                        text_buf.append(block.get("text", ""))
-        elif etype == "result":
-            usage = event.get("usage") or {}
-            tokens = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-            if tokens and a:
-                a["token_count"] = tokens
+        while True:
+            raw = await proc.stdout.readline()
+            if not raw:
+                break
+            line = raw.decode().strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+            etype = event.get("type")
+            if etype == "system" and event.get("subtype") == "init":
+                sid = event.get("session_id")
+                if sid:
+                    save_session_id(agent_dir, sid)
+            elif etype == "assistant":
+                blocks = event.get("message", {}).get("content", [])
+                if isinstance(blocks, str):
+                    text_buf.append(blocks)
+                else:
+                    for block in blocks:
+                        btype = block.get("type")
+                        if btype == "thinking":
+                            thinking_buf.append(block.get("thinking", ""))
+                        elif btype == "text":
+                            text_buf.append(block.get("text", ""))
+            elif etype == "result":
+                usage = event.get("usage") or {}
+                tokens = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+                if tokens and a:
+                    a["token_count"] = tokens
 
-    await proc.wait()
+        await proc.wait()
 
-    if proc.returncode != 0 and not text_buf:
-        stderr_data = await proc.stderr.read()
-        err = stderr_data.decode().strip() or f"claude exited with code {proc.returncode}"
-        raise RuntimeError(err)
+        if proc.returncode != 0 and not text_buf:
+            stderr_data = await proc.stderr.read()
+            err = stderr_data.decode().strip() or f"claude exited with code {proc.returncode}"
+            if session_id and attempt == 0 and "No conversation found" in err:
+                # Stale/orphaned session pointer — drop it and retry fresh instead
+                # of getting permanently stuck resuming a session that no longer exists.
+                delete_session_id(agent_dir)
+                session_id = None
+                continue
+            raise RuntimeError(err)
 
-    return {
-        "id": str(uuid.uuid4())[:8],
-        "role": "assistant",
-        "content": "".join(text_buf),
-        "thinking": "".join(thinking_buf),
-        "ts": _ts(),
-    }
+        return {
+            "id": str(uuid.uuid4())[:8],
+            "role": "assistant",
+            "content": "".join(text_buf),
+            "thinking": "".join(thinking_buf),
+            "ts": _ts(),
+        }
 
 
 # ── Telegram bot ──
@@ -1417,6 +1449,45 @@ def build_telegram_app(token: str):
             reply += f"\nLinked to project: {project['name']}"
         await update.message.reply_text(reply)
 
+    async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        chat_id = update.effective_chat.id
+        current = _tg_get_target_agent(chat_id)
+        if not ctx.args:
+            lines = []
+            if current:
+                lines.append(f"Current agent: {current['name']} — {current.get('model') or DEFAULT_MODEL}\n")
+            lines.append("Agent models:")
+            for a in agents_store.values():
+                marker = " <-- current" if current and a["id"] == current["id"] else ""
+                lines.append(f"  {a['name']} ({a['id']}): {a.get('model') or DEFAULT_MODEL}{marker}")
+            lines.append(f"\nAvailable: {', '.join(AVAILABLE_MODELS)}")
+            lines.append("Usage: /model <model> [agent name or id]")
+            await update.message.reply_text("\n".join(lines))
+            return
+        model = ctx.args[0].lower()
+        if model not in AVAILABLE_MODELS:
+            await update.message.reply_text(f"Unknown model '{model}'. Choose from: {', '.join(AVAILABLE_MODELS)}")
+            return
+        if len(ctx.args) > 1:
+            q = " ".join(ctx.args[1:]).lower()
+            agent = next((a for a in agents_store.values()
+                          if a["id"].lower() == q or a["name"].lower() == q), None)
+            if not agent:
+                await update.message.reply_text(f"Agent not found: {q}\nUse /agents to list available agents.")
+                return
+        else:
+            agent = current
+            if not agent:
+                await update.message.reply_text("No active agent.")
+                return
+        agent["model"] = model
+        save_agent(agent)
+        _tg_broadcast({"type": "agent_updated", "agent": agent})
+        await update.message.reply_text(
+            f"{agent['name']} now uses {model}."
+            + ("" if current and agent["id"] == current["id"] else f"\n(Not your current agent — current is {current['name'] if current else 'none'}.)")
+        )
+
     async def cmd_skills(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         skills = _list_installed_skills()
         if not skills:
@@ -1631,6 +1702,7 @@ def build_telegram_app(token: str):
             '/tasks complete "task" — complete a task\n'
             "/clear — clear current agent's chat history\n"
             "/compact <id> — compact an agent's context window\n"
+            "/model [model] [agent] — show or switch an agent's Claude model\n"
             "/projects — list all projects\n"
             "/newproject <name> — create a new project\n"
             "/newagent <name> [project] — create a new agent, optionally linked to a project\n"
@@ -1675,6 +1747,7 @@ def build_telegram_app(token: str):
     bot_app.add_handler(CommandHandler("routines", cmd_routines))
     bot_app.add_handler(CommandHandler("chatid", cmd_chatid))
     bot_app.add_handler(CommandHandler("screenshot", cmd_screenshot))
+    bot_app.add_handler(CommandHandler("model", cmd_model))
     bot_app.add_handler(CommandHandler("skills", cmd_skills))
     bot_app.add_handler(CommandHandler("skill", cmd_skill))
     bot_app.add_handler(CommandHandler("claudehelp", cmd_claudehelp))
@@ -1702,6 +1775,46 @@ def _run_telegram_bot_thread(token: str):
         print("Telegram bot thread exited")
 
 
+async def _headless_main():
+    """Run scheduler + Telegram bot without the HTTP/WebSocket server."""
+    global _main_loop
+    _main_loop = asyncio.get_running_loop()
+
+    load_all(agents_store, projects_store)
+    print(f"Loaded {len(projects_store)} project(s), {len(agents_store)} agent(s) from disk")
+
+    load_routines(routines_store)
+    scheduler.start()
+    for r in routines_store.values():
+        _schedule_routine(r)
+    print(f"Loaded {len(routines_store)} routine(s), scheduler started")
+
+    tg_token = os.environ.get("TELEGRAM_BOT_TOKEN")
+    if tg_token:
+        tg_thread = threading.Thread(
+            target=_run_telegram_bot_thread,
+            args=(tg_token,),
+            daemon=True,
+            name="telegram-bot",
+        )
+        tg_thread.start()
+        print("Telegram bot started (headless)")
+    else:
+        print("TELEGRAM_BOT_TOKEN not set — Telegram bot disabled")
+
+    stop_event = asyncio.Event()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        _main_loop.add_signal_handler(sig, stop_event.set)
+
+    print("Running headless. Ctrl+C to stop.")
+    await stop_event.wait()
+    scheduler.shutdown(wait=False)
+
+
 if __name__ == "__main__":
+    import sys
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=6969)
+    if "--headless" in sys.argv or os.environ.get("REGUARD_HEADLESS"):
+        asyncio.run(_headless_main())
+    else:
+        uvicorn.run(app, host="0.0.0.0", port=6969)
